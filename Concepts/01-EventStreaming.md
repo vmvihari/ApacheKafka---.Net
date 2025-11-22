@@ -43,13 +43,61 @@ sequenceDiagram
 3.  **Resource Contention**: During peak load (e.g., everyone syncing after a morning run), the service may become overwhelmed. Synchronous systems handle "backpressure" poorly; requests simply time out or fail, leading to data loss.
 4.  **Cascading Failures**: If the database slows down, the Metrics Service threads block, eventually causing the service to stop accepting new connections.
 
-### The Event Streaming Solution
+### The Event Streaming Solution: Asynchronous & Event-Driven
 
-Event streaming solves these issues by introducing an **intermediate durable log** (Kafka).
+To resolve the bottlenecks of synchronous coupling, we transition to an **Event-Driven Architecture (EDA)**. In this paradigm, the focus shifts from "requesting an action" to "announcing an occurrence."
 
-1.  **Decoupling**: The mobile app produces an event to a Kafka topic and receives an immediate acknowledgment. It does not care *when* or *how* the data is processed.
-2.  **Asynchronous Processing**: The Metrics Service consumes events from the topic at its own pace. If traffic spikes, the service lags slightly but doesn't crash.
-3.  **Fault Tolerance**: If the Metrics Service goes down, events accumulate in the Kafka topic. When the service restarts, it resumes processing from where it left off, ensuring **zero data loss**.
+#### 1. The Ingestion Layer (Smart Endpoints, Dumb Pipes)
+Instead of asking the server to "calculate metrics" (a command), the mobile device simply informs the server that "steps were taken" (an event).
+-   **Raw Data Ingestion**: The mobile device pushes raw, immutable facts (e.g., `StepsTaken`, `HeartRateRecorded`) to an Ingestion Service.
+-   **Fast Acknowledgement**: The Ingestion Service performs minimal validation, serializes the data into an event, publishes it to a Kafka topic (e.g., `raw-telemetry`), and immediately returns a `202 Accepted` response.
+-   **Client Impact**: The mobile device is released immediately. It does not wait for processing. If the backend processing is slow or down, the client is unaffected.
+
+#### 2. The Stream Processing Pipeline
+Once the event is durably stored in Kafka, a separate subsystem takes over. This is often referred to as a **Stream Processing Topology**.
+-   **Decoupled Consumers**: A "Metrics Processor" microservice subscribes to the `raw-telemetry` topic. It consumes events at its own maximum throughput.
+-   **Stateful Processing**: The processor might aggregate data (e.g., tumbling windows of 5 minutes) to calculate average heart rate or total steps.
+-   **Deriving New Events**: The result of this computation is not just written to a database but often emitted as a *new* event to a different topic (e.g., `daily-metrics-updated`).
+
+#### 3. Closing the Loop
+Downstream applications subscribe to these processed events to trigger side effects.
+-   **Notification Service**: Listens to `daily-metrics-updated` and pushes a notification to the user's device.
+-   **Data Lake Sink**: Listens to the same topic to archive data for long-term analytics.
+
+```mermaid
+sequenceDiagram
+    participant Mobile as Mobile Device
+    participant Ingest as Ingestion Gateway
+    participant Kafka as Kafka Cluster
+    participant Processor as Stream Processor
+    participant Notifier as Notification Service
+
+    Note over Mobile, Notifier: Asynchronous Pipeline (Event Streaming)
+    
+    Mobile->>Ingest: POST /telemetry (Raw Data)
+    Ingest->>Kafka: Produce: RawEvent
+    Ingest-->>Mobile: 202 Accepted (Fast Ack)
+    
+    par Parallel Consumption
+        loop Stream Processing
+            Kafka->>Processor: Consume: RawEvent
+            Processor->>Processor: Aggregate & Compute
+            Processor->>Kafka: Produce: MetricsEvent
+        end
+        
+        loop Reaction
+            Kafka->>Notifier: Consume: MetricsEvent
+            Notifier->>Mobile: Push Notification
+        end
+    end
+```
+
+### Technical Advantages
+
+1.  **Temporal Decoupling**: The producer (mobile app) and consumer (metrics engine) do not need to be online at the same time. Kafka acts as a **persistent buffer**, absorbing load spikes and allowing consumers to catch up.
+2.  **Eventual Consistency**: The system trades immediate consistency (ACID) for availability and partition tolerance (BASE). The mobile view will be updated "eventually" (usually milliseconds to seconds), but the system remains highly available.
+3.  **Polyglot Consumption**: The `raw-telemetry` topic becomes a "source of truth." New services (e.g., a Machine Learning model for anomaly detection) can be added to subscribe to this topic without modifying the mobile app or the ingestion service.
+4.  **Backpressure Management**: If the database slows down, the Stream Processor simply slows its consumption rate. The Ingestion Service continues accepting data at full speed, preventing cascading failures.
 
 ## Core Concepts
 
